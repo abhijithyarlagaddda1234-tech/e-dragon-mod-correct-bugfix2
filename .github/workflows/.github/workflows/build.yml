@@ -1,0 +1,38 @@
+name: Build Mod
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Install Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build
+        run: gradle build
+
+      - name: Verify Mod
+        run: |
+          JAR=$(find build/libs -name '*.jar' ! -name '*sources.jar' | head -n 1)
+          test -n "$JAR"
+          jar tf "$JAR" | grep -q 'fabric.mod.json'
+          jar tf "$JAR" | grep -q 'EnderDragonOverhaul.class'
+
+      - name: Upload Mod
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ender-Dragon-Mod
+          path: |
+            build/libs/*.jar
+            !build/libs/*sources.jar
