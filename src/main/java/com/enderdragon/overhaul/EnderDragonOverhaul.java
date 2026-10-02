@@ -14,7 +14,6 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.boss.enderdragon.EnderDragon;
 import net.minecraft.world.entity.boss.enderdragon.EndCrystal;
-import net.minecraft.world.entity.projectile.hurtingprojectile.DragonFireball;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -32,7 +31,6 @@ public final class EnderDragonOverhaul implements ModInitializer {
     private static final double RADIUS = 128.0D;
     private static final AABB DRAGON_SEARCH = new AABB(-192, -64, -192, 192, 320, 192);
     private static final Map<UUID, State> STATES = new HashMap<>();
-    private static final double MAX_DIVE_ARENA_RADIUS = 110.0D;
 
     @Override
     public void onInitialize() {
@@ -67,7 +65,7 @@ public final class EnderDragonOverhaul implements ModInitializer {
         tickDive(level, dragon, s);
         tickLaser(level, dragon, s);
         tickOrbs(level, s);
-        tickBreath(level, dragon, s);
+        tickBreath(level, s);
         tickChargedShockwave(level, dragon, s);
         updateCrystalCounter(level, dragon);
 
@@ -102,162 +100,82 @@ public final class EnderDragonOverhaul implements ModInitializer {
     }
 
     private static void chooseAttack(ServerLevel level, EnderDragon dragon, ServerPlayer target, State s) {
-        // Cycling through attacks avoids Starvation: the next available move gets its turn.
-        // The laser gets a reserved opportunity in phase 2+ even after a triple-dive.
-        for (int attempt = 0; attempt < 5; attempt++) {
+        for (int attempt = 0; attempt < 6; attempt++) {
             int choice = s.nextAttack++ % 5;
-            if (choice == 0) {
-                startBreath(level, dragon, target, s);
-                return;
-            }
-            if (choice == 1 && s.diveCooldown == 0) {
-                startDive(level, dragon, target, s);
-                return;
-            }
-            if (choice == 2 && s.phase >= 2 && s.laserCooldown == 0) {
-                startLaser(level, dragon, target, s);
-                return;
-            }
-            if (choice == 3 && s.phase >= 2 && s.orbCooldown == 0) {
-                startOrbs(level, dragon, target, s);
-                return;
-            }
-            if (choice == 4 && s.phase >= 3 && s.shockwaveCooldown == 0) {
-                startShockwave(dragon, s);
-                return;
-            }
+            if (choice == 0) { startBreath(dragon, target, s); return; }
+            if (choice == 1 && s.diveCooldown == 0) { startDive(level, dragon, target, s); return; }
+            if (choice == 2 && s.phase >= 2 && s.laserCooldown == 0) { startLaser(level, dragon, target, s); return; }
+            if (choice == 3 && s.phase >= 2 && s.orbCooldown == 0) { startOrbs(dragon, target, s); return; }
+            if (choice == 4 && s.phase >= 3 && s.shockwaveCooldown == 0) { startShockwave(dragon, s); return; }
         }
-        startBreath(level, dragon, target, s);
+        startBreath(dragon, target, s);
     }
 
-    private static void startDive(ServerLevel level, EnderDragon dragon,
-                                  ServerPlayer target, State s) {
+    private static void startDive(ServerLevel level, EnderDragon dragon, ServerPlayer target, State s) {
         s.target = target.getUUID();
         s.divesRemaining = s.phase >= 2 ? 3 : 1;
-        s.diveCooldown = cooldown(s.phase, 200);
-        s.attackCooldown = cooldown(s.phase, s.phase >= 2 ? 185 : 145);
-        s.diveActive = true;
-        startDiveWindup(level, dragon, target, s);
+        s.diveCooldown = cooldown(s.phase, 190);
+        s.attackCooldown = cooldown(s.phase, s.phase >= 2 ? 210 : 150);
+        beginDive(level, dragon, target, s);
     }
 
-    private static void startDiveWindup(ServerLevel level, EnderDragon dragon,
-                                        ServerPlayer target, State s) {
-        s.diveStage = 0; // 0=turn/windup, 1=committed dive, 2=recover/climb.
-        s.diveTimer = 18;
-        s.diveTarget = target.position().add(
-                target.getDeltaMovement().scale(5.0D)).add(0.0D, 1.0D, 0.0D);
+    private static void beginDive(ServerLevel level, EnderDragon dragon, ServerPlayer target, State s) {
+        s.diveActive = true;
+        s.diveDelay = 0;
+        s.diveTimer = 42;
+        s.diveTarget = target.position().add(0, 0.5, 0);
         warning(level, s.diveTarget);
-        dragon.playSound(SoundEvents.ENDER_DRAGON_GROWL, 3.0F, 0.70F);
+        dragon.playSound(SoundEvents.ENDER_DRAGON_GROWL, 3.0F, 0.65F);
     }
 
     private static void tickDive(ServerLevel level, EnderDragon dragon, State s) {
         if (!s.diveActive) return;
 
-        if (s.diveStage == 2) {
-            // An actual upward recovery makes triple-dive feel like three attacks.
-            s.diveTimer--;
-            Vec3 climb = new Vec3(0.0D, 0.78D, 0.0D);
-            dragon.setDeltaMovement(dragon.getDeltaMovement().scale(0.60D).add(climb.scale(0.40D)));
-            if (s.diveTimer <= 0) {
+        if (s.diveDelay > 0) {
+            s.diveDelay--;
+            if (s.diveDelay == 0) {
                 ServerPlayer next = nearest(level, dragon);
                 if (next == null) { s.diveActive = false; return; }
                 s.target = next.getUUID();
-                startDiveWindup(level, dragon, next, s);
+                beginDive(level, dragon, next, s);
             }
             return;
         }
 
         if (s.diveTarget == null) { s.diveActive = false; return; }
         s.diveTimer--;
-        ServerPlayer target = player(level, s.target);
-        if (target == null) { s.diveActive = false; return; }
-
-        if (s.diveStage == 0) {
-            // Gradually turn before moving. Never snap the body toward the target.
-            Vec3 liveAim = target.position().add(0.0D, 1.0D, 0.0D);
-            faceToward(dragon, liveAim, 7.5F, 5.0F);
-            dragon.setDeltaMovement(dragon.getDeltaMovement().scale(0.70D));
-            if (s.tick % 3 == 0) {
-                level.sendParticles(ParticleTypes.ELECTRIC_SPARK,
-                        dragon.getX(), dragon.getY() + 1.0D, dragon.getZ(),
-                        3, 1.3D, 0.5D, 1.3D, 0.02D);
-            }
-            if (s.diveTimer <= 0) {
-                s.diveTarget = target.position().add(
-                        target.getDeltaMovement().scale(4.0D)).add(0, 0.7D, 0);
-                s.diveStage = 1;
-                s.diveTimer = 76;
-            }
-            return;
-        }
 
         Vec3 to = s.diveTarget.subtract(dragon.position());
         double distance = to.length();
-
-        // Turn at a limited angular speed AND steer using the resulting heading.
-        // Velocity lerping gives inertia, avoiding the old 'grabbed and thrown' feel.
-        faceToward(dragon, s.diveTarget, 10.5F, 7.0F);
-        double angle = Math.toRadians(dragon.getYRot());
-        double speed = 0.94D + 0.08D * s.phase;
-        double dy = clamp(to.y * 0.050D, -0.65D, 0.25D);
-        Vec3 desired = new Vec3(-Math.sin(angle) * speed, dy, Math.cos(angle) * speed);
-        dragon.setDeltaMovement(dragon.getDeltaMovement().scale(0.66D).add(desired.scale(0.34D)));
-
-        if (s.tick % 4 == 0) {
-            level.sendParticles(PowerParticleOption.create(ParticleTypes.DRAGON_BREATH, 1.0F),
-                    dragon.getX(), dragon.getY(), dragon.getZ(),
-                    2, 1.0D, 0.4D, 1.0D, 0.012D);
+        if (distance > 0.001D) {
+            double speed = 1.15D + s.phase * 0.12D;
+            dragon.setDeltaMovement(to.normalize().scale(speed));
+            // Velocity is applied with setDeltaMovement above.
         }
 
-        boolean nearTarget = distance <= 5.5D;
-        boolean timedOut = s.diveTimer <= 0;
-        if (!nearTarget && !timedOut) return;
+        if (s.tick % 2 == 0) {
+            level.sendParticles(PowerParticleOption.create(ParticleTypes.DRAGON_BREATH, 1.0F), dragon.getX(), dragon.getY(), dragon.getZ(),
+                    2, 1.2, 0.6, 1.2, 0.01);
+        }
 
-        // Avoid cheap off-target blasts when vanilla AI prevents an intercept.
-        if (nearTarget && inArena(dragon.position())) {
+        if (distance <= 4.5D || s.diveTimer <= 0) {
             boolean last = s.divesRemaining == 1;
-            shockwave(level, dragon.position(), last ? 10.0D : 8.0D,
-                    8.0F + s.phase * 1.5F + (last ? 3.0F : 0.0F));
-        }
-        s.divesRemaining--;
-        if (s.divesRemaining > 0) {
-            s.diveStage = 2;
-            s.diveTimer = 24;
-        } else {
-            s.diveActive = false;
+            shockwave(level, dragon.position(), last ? 11.0D : 8.5D,
+                    9.0F + s.phase * 2.0F + (last ? 3.0F : 0.0F));
+            s.divesRemaining--;
             s.diveTarget = null;
+            if (s.divesRemaining > 0) s.diveDelay = 14;
+            else s.diveActive = false;
         }
-    }
-
-    private static boolean inArena(Vec3 location) {
-        return location.x * location.x + location.z * location.z
-                <= MAX_DIVE_ARENA_RADIUS * MAX_DIVE_ARENA_RADIUS;
-    }
-
-    private static double clamp(double value, double low, double high) {
-        return Math.max(low, Math.min(high, value));
-    }
-
-    private static void faceToward(EnderDragon dragon, Vec3 point,
-                                   float maxYawStep, float maxPitchStep) {
-        Vec3 to = point.subtract(dragon.position());
-        if (to.lengthSqr() < 0.001D) return;
-        float desiredYaw = (float) Math.toDegrees(Math.atan2(-to.x, to.z));
-        float yawDelta = (float) Math.IEEEremainder(desiredYaw - dragon.getYRot(), 360.0D);
-        dragon.setYRot(dragon.getYRot() + (float) clamp(yawDelta, -maxYawStep, maxYawStep));
-        double flat = Math.hypot(to.x, to.z);
-        float desiredPitch = (float) Math.toDegrees(Math.atan2(-to.y, flat));
-        float pitchDelta = (float) Math.IEEEremainder(desiredPitch - dragon.getXRot(), 360.0D);
-        dragon.setXRot(dragon.getXRot() + (float) clamp(pitchDelta, -maxPitchStep, maxPitchStep));
     }
 
     private static void startLaser(ServerLevel level, EnderDragon dragon, ServerPlayer target, State s) {
         s.target = target.getUUID();
-        s.laserTarget = target.position().add(0.0D, 1.0D, 0.0D);
-        s.laserCharge = 48;     // 2.4 second warning.
+        s.laserTarget = target.position().add(0, 1.0, 0);
+        s.laserCharge = 36;
         s.laserActive = 0;
-        s.laserCooldown = cooldown(s.phase, 210);
-        s.attackCooldown = cooldown(s.phase, 150);
+        s.laserCooldown = cooldown(s.phase, 240);
+        s.attackCooldown = cooldown(s.phase, 210);
         warning(level, s.laserTarget);
         dragon.playSound(SoundEvents.BEACON_ACTIVATE, 4.0F, 0.45F);
     }
@@ -265,56 +183,47 @@ public final class EnderDragonOverhaul implements ModInitializer {
     private static void tickLaser(ServerLevel level, EnderDragon dragon, State s) {
         if (s.laserCharge > 0) {
             s.laserCharge--;
-            dragon.setDeltaMovement(dragon.getDeltaMovement().scale(0.72D));
-            ServerPlayer target = player(level, s.target);
-            if (target != null && s.laserCharge > 12) {
-                s.laserTarget = target.position().add(0.0D, 1.0D, 0.0D);
+            dragon.setDeltaMovement(dragon.getDeltaMovement().scale(0.25D));
+            Vec3 origin = dragon.position().add(0, 1.5, 0);
+            if (s.laserTarget != null && s.tick % 3 == 0) {
+                Vec3 preview = s.laserTarget.subtract(origin);
+                if (preview.lengthSqr() > 0.001D)
+                    renderBeam(level, origin, preview.normalize(), 60, ParticleTypes.ELECTRIC_SPARK, 8);
             }
-            if (s.laserTarget != null) {
-                faceToward(dragon, s.laserTarget, 5.0F, 4.0F);
-                Vec3 origin = dragon.position().add(0.0D, 1.5D, 0.0D);
-                Vec3 beam = s.laserTarget.subtract(origin);
-                if (beam.lengthSqr() > 0.001D && s.tick % 3 == 0) {
-                    renderBeam(level, origin, beam.normalize(), Math.min(90, beam.length()),
-                            ParticleTypes.ELECTRIC_SPARK, 5.0D);
+            if (s.laserCharge == 0 && s.laserTarget != null) {
+                Vec3 dir = s.laserTarget.subtract(origin);
+                if (dir.lengthSqr() > 0.001D) {
+                    s.laserDirection = dir.normalize();
+                    s.laserActive = 32;
+                    dragon.playSound(SoundEvents.BEACON_POWER_SELECT, 5.0F, 0.35F);
                 }
-            }
-            if (s.laserCharge == 0) {
-                if (s.laserTarget == null) return;
-                Vec3 from = dragon.position().add(0.0D, 1.5D, 0.0D);
-                Vec3 path = s.laserTarget.subtract(from);
-                if (path.lengthSqr() < 0.001D) return;
-                s.laserDirection = path.normalize();
-                s.laserActive = 44;
-                dragon.playSound(SoundEvents.BEACON_POWER_SELECT, 5.0F, 0.35F);
             }
             return;
         }
 
         if (s.laserActive <= 0 || s.laserDirection == null) return;
         s.laserActive--;
-        dragon.setDeltaMovement(dragon.getDeltaMovement().scale(0.66D));
+        dragon.setDeltaMovement(dragon.getDeltaMovement().scale(0.15D));
 
-        Vec3 origin = dragon.position().add(0.0D, 1.5D, 0.0D);
-        Vec3 end = origin.add(s.laserDirection.scale(95.0D));
-        if (s.tick % 2 == 0) {
-            renderBeam(level, origin, s.laserDirection, 95.0D, ParticleTypes.END_ROD, 3.0D);
-        }
+        Vec3 origin = dragon.position().add(0, 1.5, 0);
+        Vec3 end = origin.add(s.laserDirection.scale(64));
 
-        // The exact same origin and endpoint are used for visuals and hit checks.
-        // No instant undodgeable damage: the direction was locked before firing.
+        if (s.tick % 2 == 0)
+            renderBeam(level, origin, s.laserDirection, 64, ParticleTypes.END_ROD, 3);
+
         if (s.tick % 5 == 0) {
             for (ServerPlayer p : participants(level)) {
-                if (distancePointSegment(p.position().add(0, 1, 0), origin, end) < 3.0D) {
-                    p.hurt(level.damageSources().dragonBreath(), 10.0F + s.phase * 2.0F);
+                if (distancePointSegment(p.position().add(0, 1, 0), origin, end) <= 2.4D) {
+                    p.hurt(level.damageSources().dragonBreath(), 11.0F + s.phase * 2.0F);
                     Vec3 push = p.position().subtract(origin);
                     if (push.lengthSqr() > 0.001D) {
-                        push = push.normalize().scale(0.55D);
-                        p.push(push.x, 0.22D, push.z);
+                        push = push.normalize().scale(0.7D);
+                        p.push(push.x, 0.25D, push.z);
                     }
                 }
             }
         }
+
         if (s.laserActive == 0) {
             s.laserDirection = null;
             s.laserTarget = null;
@@ -329,20 +238,14 @@ public final class EnderDragonOverhaul implements ModInitializer {
         }
     }
 
-    private static void startOrbs(ServerLevel level, EnderDragon dragon,
-                                  ServerPlayer target, State s) {
-        s.orbCooldown = cooldown(s.phase, 205);
-        s.attackCooldown = cooldown(s.phase, 145);
-        int count = Math.min(5, 2 + s.phase);
+    private static void startOrbs(EnderDragon dragon, ServerPlayer target, State s) {
+        s.orbCooldown = cooldown(s.phase, 190);
+        s.attackCooldown = cooldown(s.phase, 120);
+        int count = Math.min(6, 2 + s.phase);
         for (int i = 0; i < count; i++) {
-            double angle = 2.0D * Math.PI * i / count;
-            Vec3 spawn = dragon.position().add(Math.cos(angle) * 4.0D,
-                    1.0D + (i % 2), Math.sin(angle) * 4.0D);
-            Orb orb = new Orb(spawn, target.getUUID(), 140);
-            orb.windup = 24 + i * 3;
-            s.orbs.add(orb);
-            level.sendParticles(ParticleTypes.END_ROD, spawn.x, spawn.y, spawn.z,
-                    8, 0.35D, 0.35D, 0.35D, 0.015D);
+            double a = Math.PI * 2.0D * i / count;
+            Vec3 offset = new Vec3(Math.cos(a) * 3, 1 + (i % 2), Math.sin(a) * 3);
+            s.orbs.add(new Orb(dragon.position().add(offset), target.getUUID(), 100));
         }
         dragon.playSound(SoundEvents.RESPAWN_ANCHOR_CHARGE, 2.5F, 1.35F);
     }
@@ -355,73 +258,46 @@ public final class EnderDragonOverhaul implements ModInitializer {
             ServerPlayer target = player(level, orb.target);
             if (target == null || orb.life <= 0) { it.remove(); continue; }
 
-            if (orb.windup > 0) {
-                orb.windup--;
-                // Visible charging ball near the dragon before it starts tracking.
-                if (orb.windup % 3 == 0) {
-                    level.sendParticles(ParticleTypes.END_ROD,
-                            orb.position.x, orb.position.y, orb.position.z,
-                            4, 0.38D, 0.38D, 0.38D, 0.005D);
-                }
-                continue;
-            }
-
-            Vec3 targetPoint = target.position().add(0.0D, 1.0D, 0.0D);
+            Vec3 targetPoint = target.position().add(0, 1, 0);
             Vec3 to = targetPoint.subtract(orb.position);
-            if (to.lengthSqr() > 0.001D) {
-                Vec3 direction = to.normalize();
-                double speed = 0.35D + s.phase * 0.025D;
-                orb.position = orb.position.add(direction.scale(speed));
-            }
+            if (to.lengthSqr() > 0.001D)
+                orb.position = orb.position.add(to.normalize().scale(0.28D + s.phase * 0.035D));
 
-            if (s.tick % 2 == 0) {
-                level.sendParticles(ParticleTypes.END_ROD,
-                        orb.position.x, orb.position.y, orb.position.z,
-                        2, 0.12D, 0.12D, 0.12D, 0.01D);
-            }
-            if (orb.position.distanceTo(targetPoint) <= 1.4D) {
+            level.sendParticles(ParticleTypes.PORTAL, orb.position.x, orb.position.y, orb.position.z,
+                    2, 0.12, 0.12, 0.12, 0.01);
+
+            if (orb.position.distanceTo(targetPoint) <= 1.6D) {
                 target.hurt(level.damageSources().dragonBreath(), 5.0F + s.phase);
-                level.sendParticles(ParticleTypes.EXPLOSION,
-                        orb.position.x, orb.position.y, orb.position.z,
-                        2, 0.3D, 0.3D, 0.3D, 0.0D);
+                level.sendParticles(ParticleTypes.EXPLOSION, orb.position.x, orb.position.y, orb.position.z,
+                        2, 0.3, 0.3, 0.3, 0.0);
                 it.remove();
             }
         }
     }
 
-    private static void startBreath(ServerLevel level, EnderDragon dragon,
-                                    ServerPlayer target, State s) {
+    private static void startBreath(EnderDragon dragon, ServerPlayer target, State s) {
         s.target = target.getUUID();
-        s.breathBursts = Math.min(5, 2 + s.phase);
-        s.breathTimer = 22; // Warning/charge before the first actual projectile.
-        s.attackCooldown = cooldown(s.phase, 145);
-        warning(level, target.position());
+        s.breathBursts = Math.min(7, 3 + s.phase);
+        s.breathTimer = 1;
+        s.attackCooldown = cooldown(s.phase, 105);
         dragon.playSound(SoundEvents.ENDER_DRAGON_GROWL, 3.0F, 0.75F);
     }
 
-    private static void tickBreath(ServerLevel level, EnderDragon dragon, State s) {
+    private static void tickBreath(ServerLevel level, State s) {
         if (s.breathBursts <= 0) return;
         if (s.breathTimer > 0) { s.breathTimer--; return; }
+
         ServerPlayer target = player(level, s.target);
         if (target == null) { s.breathBursts = 0; return; }
+        Vec3 point = target.position().add(0, 0.5, 0);
+        level.sendParticles(PowerParticleOption.create(ParticleTypes.DRAGON_BREATH, 1.0F), point.x, point.y, point.z,
+                8, 1.2, 0.5, 1.2, 0.02);
 
-        // Real vanilla DragonFireball entity, aimed at a live player instead of
-        // particles/damage appearing on the player's current coordinates.
-        Vec3 spawn = dragon.position().add(0.0D, 2.5D, 0.0D);
-        Vec3 predicted = target.position().add(0.0D, 1.0D, 0.0D).add(
-                target.getDeltaMovement().scale(6.0D));
-        Vec3 aim = predicted.subtract(spawn);
-        if (aim.lengthSqr() > 0.01D) {
-            DragonFireball projectile = new DragonFireball(level, dragon, aim.normalize());
-            Vec3 nose = spawn.add(aim.normalize().scale(3.2D));
-            projectile.setPos(nose.x, nose.y, nose.z);
-            level.addFreshEntity(projectile);
-            level.sendParticles(PowerParticleOption.create(ParticleTypes.DRAGON_BREATH, 1.0F),
-                    nose.x, nose.y, nose.z, 7, 0.6D, 0.6D, 0.6D, 0.02D);
-            dragon.playSound(SoundEvents.ENDER_DRAGON_GROWL, 2.8F, 0.8F);
-        }
+        for (ServerPlayer p : level.getEntitiesOfClass(ServerPlayer.class, new AABB(point, point).inflate(3.5D)))
+            p.hurt(level.damageSources().dragonBreath(), 4.0F + s.phase);
+
         s.breathBursts--;
-        s.breathTimer = 11;
+        s.breathTimer = 8;
     }
 
     private static void startShockwave(EnderDragon dragon, State s) {
@@ -563,7 +439,6 @@ public final class EnderDragonOverhaul implements ModInitializer {
         Vec3 position;
         final UUID target;
         int life;
-        int windup;
         Orb(Vec3 position, UUID target, int life) {
             this.position = position;
             this.target = target;
@@ -578,7 +453,6 @@ public final class EnderDragonOverhaul implements ModInitializer {
         int tick, phase, nextAttack;
         int attackCooldown, diveCooldown, laserCooldown, orbCooldown, shockwaveCooldown;
         int divesRemaining, diveDelay, diveTimer;
-        int diveStage;
         int laserCharge, laserActive;
         int breathBursts, breathTimer, shockwaveCharge, finalTimer;
         int lastCrystalCount = -1;
